@@ -153,7 +153,7 @@ onBeforeUnmount(() => {
   </div>
 </template>
 
-<style scoped lang="scss">
+<style scoped lang="less">
 .floating-video {
   position: fixed;
   z-index: 2000;
