@@ -329,6 +329,15 @@ const localVideoStream = ref<MediaStream | undefined>(undefined);
 const remoteVideoStreams = ref<{ [key: string]: MediaStream }>({});
 // 视频发送码率上限(bps)，限制 mesh 拓扑下的上行带宽
 const videoMaxBitrate = 600_000;
+const screenMaxBitrate = 1_500_000;
+
+// 屏幕共享：本地共享流、是否正在共享、远端屏幕流，以及各对端声明的屏幕流 id
+const localScreenStream = ref<MediaStream | undefined>(undefined);
+const isScreenSharing = ref(false);
+const remoteScreenStreams = ref<{ [key: string]: MediaStream }>({});
+const peerScreenStreamId: { [key: string]: string | undefined } = {};
+// mesh 下人人互联：只要有任一对端在推屏幕流，即视为"已有人在共享"
+const someoneElseSharing = computed(() => Object.keys(remoteScreenStreams.value).length > 0);
 
 // 将 MediaStream 绑定到 <video>/<audio> 元素的 srcObject
 const vSrcobject = {
@@ -417,14 +426,25 @@ const adjustOutputVolume = () => {
   });
 };
 
-// 限制视频发送码率，避免 mesh 拓扑下上行带宽随人数线性膨胀
-const applyVideoSenderParams = async (sender: RTCRtpSender) => {
+// 限制视频发送码率，避免 mesh 拓扑下上行带宽随人数线性膨胀。
+// degradationPreference 在带宽受限时决定"降帧率"还是"降分辨率"：
+// 屏幕共享多为文字，应保分辨率(maintain-resolution)以保证可读性。
+const applyVideoSenderParams = async (
+  sender: RTCRtpSender,
+  maxBitrate = videoMaxBitrate,
+  degradationPreference?: "maintain-framerate" | "maintain-resolution" | "balanced"
+) => {
   try {
     const params = sender.getParameters();
     if (!params.encodings || params.encodings.length === 0) {
       params.encodings = [{}];
     }
-    params.encodings[0].maxBitrate = videoMaxBitrate;
+    params.encodings[0].maxBitrate = maxBitrate;
+    if (degradationPreference) {
+      // degradationPreference 在部分 TS lib.dom 中尚未声明，做局部断言
+      (params as RTCRtpSendParameters & { degradationPreference?: string }).degradationPreference =
+        degradationPreference;
+    }
     await sender.setParameters(params);
   } catch (err) {
     console.error("设置视频发送参数失败:", err);
@@ -452,6 +472,8 @@ const startCamera = async () => {
   }
   const [videoTrack] = localVideoStream.value.getVideoTracks();
   if (!videoTrack) return;
+  // 摄像头画面以动态为主，提示编码器优先保帧率
+  videoTrack.contentHint = "motion";
   // 向所有已建立的连接添加视频轨道，触发 onnegotiationneeded 重协商
   for (const pc of Object.values(peerConnections.value)) {
     const sender = pc.addTrack(videoTrack, localVideoStream.value);
@@ -496,6 +518,85 @@ const switchCamera = async () => {
   localVideoStream.value = newStream;
 };
 
+// 切换屏幕共享
+const toggleScreenShare = async () => {
+  if (!localStream.value) return;
+  if (isScreenSharing.value) {
+    await stopScreenShare();
+  } else {
+    await startScreenShare();
+  }
+};
+
+const startScreenShare = async () => {
+  if (someoneElseSharing.value) {
+    ElMessage.warning("已有成员正在共享屏幕");
+    return;
+  }
+  try {
+    // 采集屏幕视频与(可选的)系统/标签页音频；显示光标、避免选中本应用标签页、
+    // 允许中途切换共享源。部分约束在 TS lib.dom 中尚未声明，整体做一次断言。
+    localScreenStream.value = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        cursor: "always",
+        frameRate: { ideal: 15, max: 30 },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: true,
+      systemAudio: "include",
+      selfBrowserSurface: "exclude",
+      surfaceSwitching: "include"
+    } as MediaStreamConstraints);
+  } catch (err) {
+    // 用户取消选择时也会进入此分支，不弹错误
+    return;
+  }
+  const [screenTrack] = localScreenStream.value.getVideoTracks();
+  if (!screenTrack) return;
+  // 屏幕内容多为文字，提示编码器优先保分辨率(可读性)
+  screenTrack.contentHint = "text";
+  // 响应浏览器原生"停止共享"按钮
+  screenTrack.onended = () => {
+    stopScreenShare();
+  };
+  // 添加屏幕的全部轨道(视频 + 系统音频)，触发重协商
+  for (const pc of Object.values(peerConnections.value)) {
+    for (const track of localScreenStream.value.getTracks()) {
+      const sender = pc.addTrack(track, localScreenStream.value);
+      if (track.kind === "video") {
+        await applyVideoSenderParams(sender, screenMaxBitrate, "maintain-resolution");
+      }
+    }
+  }
+  isScreenSharing.value = true;
+};
+
+const stopScreenShare = async () => {
+  const screenTracks = new Set(localScreenStream.value?.getTracks() ?? []);
+  for (const pc of Object.values(peerConnections.value)) {
+    for (const sender of pc.getSenders()) {
+      if (sender.track && screenTracks.has(sender.track)) {
+        pc.removeTrack(sender);
+      }
+    }
+  }
+  localScreenStream.value?.getTracks().forEach((track) => track.stop());
+  localScreenStream.value = undefined;
+  isScreenSharing.value = false;
+};
+
+// 双击视频块在全屏与还原之间切换，便于专注观看共享的屏幕。
+const toggleFullscreen = (event: MouseEvent) => {
+  const el = event.currentTarget as HTMLVideoElement | null;
+  if (!el) return;
+  if (document.fullscreenElement) {
+    document.exitFullscreen().catch((err) => console.error("退出全屏失败:", err));
+  } else {
+    el.requestFullscreen().catch((err) => console.error("进入全屏失败:", err));
+  }
+};
+
 const joinWebRTC = async () => {
   try {
     await getAudioDevices();
@@ -531,6 +632,10 @@ const exitWebRTC = async () => {
   localVideoStream.value = undefined;
   isCameraOn.value = false;
   remoteVideoStreams.value = {};
+  localScreenStream.value?.getTracks().forEach((track) => track.stop());
+  localScreenStream.value = undefined;
+  isScreenSharing.value = false;
+  remoteScreenStreams.value = {};
 };
 
 const handleWebrtcJoin = async (msg: Message) => {
@@ -552,17 +657,26 @@ const closePeerConnection = (id: string) => {
   }
   delete peerStates[id];
   delete remoteVideoStreams.value[id];
-  const remoteAudio = remoteAudioElements[id];
-  if (remoteAudio) {
-    remoteAudio.pause();
-    remoteAudio.srcObject = null;
-    delete remoteAudioElements[id];
+  delete remoteScreenStreams.value[id];
+  delete peerScreenStreamId[id];
+  // 同时清理该对端的麦克风音频与屏幕系统音频元素。
+  for (const key of [id, `screen:${id}`]) {
+    const remoteAudio = remoteAudioElements[key];
+    if (remoteAudio) {
+      remoteAudio.pause();
+      remoteAudio.srcObject = null;
+      delete remoteAudioElements[key];
+    }
   }
 };
 
 const handleWebrtcOffer = async (msg: Message) => {
   const id = msg.webrtcData!.from;
-  const description = JSON.parse(msg.webrtcData!.data) as RTCSessionDescriptionInit;
+  const payload = JSON.parse(msg.webrtcData!.data);
+  // Unwrap the envelope { sdp, screenId }; fall back to a raw description for
+  // robustness. Record which remote stream id (if any) carries the screen.
+  const description = (payload.sdp ?? payload) as RTCSessionDescriptionInit;
+  peerScreenStreamId[id] = payload.screenId;
   let pc = peerConnections.value[id];
   if (!pc) {
     // First offer from this peer (we are the joining side) → polite responder.
@@ -607,7 +721,13 @@ const createPeerConnection = (id: string, polite: boolean) => {
         Message.create({
           type: MessageType.WEBRTC_OFFER,
           webrtcData: {
-            data: JSON.stringify(pc.localDescription),
+            // Envelope carries the screen-share stream id so receivers can tell
+            // a screen track apart from a camera track. The backend treats
+            // `data` as opaque, so no proto change is needed.
+            data: JSON.stringify({
+              sdp: pc.localDescription,
+              screenId: localScreenStream.value?.id
+            }),
             to: id
           }
         })
@@ -633,32 +753,14 @@ const createPeerConnection = (id: string, polite: boolean) => {
     }
   };
   pc.ontrack = (event) => {
+    const stream = event.streams[0];
+    // 通过对端 offer 信封声明的 screenId 判断该流是屏幕流还是摄像头/麦克风流。
+    const isScreen = !!peerScreenStreamId[id] && stream.id === peerScreenStreamId[id];
     if (event.track.kind === "video") {
-      bindRemoteVideoTrack(id, event.track, event.streams[0]);
-      return;
+      bindRemoteVideoTrack(id, event.track, stream, isScreen);
+    } else {
+      bindRemoteAudioTrack(id, event.track, stream, isScreen);
     }
-    // 音频已存在则复用，避免重复创建元素(重协商时 ontrack 可能再次触发)
-    if (remoteAudioElements[id]) {
-      remoteAudioElements[id].srcObject = event.streams[0];
-      return;
-    }
-    const remoteAudio = document.createElement("audio");
-    remoteAudio.srcObject = event.streams[0];
-    remoteAudio.volume = outputVolume.value;
-    if (selectedAudioOutput.value && "setSinkId" in remoteAudio) {
-      (remoteAudio as any).setSinkId(selectedAudioOutput.value).catch((error: any) => {
-        console.error("扬声器设置失败:", error);
-      });
-    }
-    remoteAudio.style.display = "none";
-    remoteAudio.onended = () => {
-      document.body.removeChild(remoteAudio);
-      delete remoteAudioElements[id];
-    };
-    remoteAudioElements[id] = remoteAudio;
-    remoteAudio.play().catch((error) => {
-      console.error("Audio playback failed:", error);
-    });
   };
 
   // 音频轨道
@@ -670,22 +772,73 @@ const createPeerConnection = (id: string, polite: boolean) => {
       applyVideoSenderParams(sender);
     }
   }
+  // 若本地正在共享屏幕，同样补发屏幕的全部轨道(视频 + 系统音频)
+  if (localScreenStream.value) {
+    for (const track of localScreenStream.value.getTracks()) {
+      const sender = pc.addTrack(track, localScreenStream.value);
+      if (track.kind === "video") {
+        applyVideoSenderParams(sender, screenMaxBitrate, "maintain-resolution");
+      }
+    }
+  }
   peerConnections.value[id] = pc;
   return pc;
 };
 
-// 绑定远端视频轨道到响应式 map，并处理静音/结束时的画面增删
-const bindRemoteVideoTrack = (id: string, track: MediaStreamTrack, stream: MediaStream) => {
-  remoteVideoStreams.value[id] = stream;
+// 绑定远端视频轨道到响应式 map，并处理静音/结束时的画面增删。
+// isScreen 由调用方依据 offer 信封里的 screenId 判定，用于区分屏幕流与摄像头流。
+const bindRemoteVideoTrack = (
+  id: string,
+  track: MediaStreamTrack,
+  stream: MediaStream,
+  isScreen: boolean
+) => {
+  const target = isScreen ? remoteScreenStreams : remoteVideoStreams;
+  target.value[id] = stream;
   track.onunmute = () => {
-    remoteVideoStreams.value[id] = stream;
+    target.value[id] = stream;
   };
   track.onmute = () => {
-    delete remoteVideoStreams.value[id];
+    delete target.value[id];
   };
   track.onended = () => {
-    delete remoteVideoStreams.value[id];
+    delete target.value[id];
   };
+};
+
+// 绑定远端音频轨道并播放。屏幕的系统音频与麦克风音频使用不同的 key
+// (screen:${id} vs id)，避免共享屏幕时覆盖对端的麦克风音频元素。
+const bindRemoteAudioTrack = (
+  id: string,
+  track: MediaStreamTrack,
+  stream: MediaStream,
+  isScreen: boolean
+) => {
+  const key = isScreen ? `screen:${id}` : id;
+  // 重协商时 ontrack 可能再次触发，已存在则复用元素仅更新 srcObject。
+  const existing = remoteAudioElements[key];
+  if (existing) {
+    existing.srcObject = stream;
+    return;
+  }
+  const remoteAudio = document.createElement("audio");
+  remoteAudio.srcObject = stream;
+  remoteAudio.volume = outputVolume.value;
+  if (selectedAudioOutput.value && "setSinkId" in remoteAudio) {
+    (remoteAudio as any).setSinkId(selectedAudioOutput.value).catch((error: any) => {
+      console.error("扬声器设置失败:", error);
+    });
+  }
+  remoteAudio.style.display = "none";
+  track.onended = () => {
+    remoteAudio.pause();
+    remoteAudio.srcObject = null;
+    delete remoteAudioElements[key];
+  };
+  remoteAudioElements[key] = remoteAudio;
+  remoteAudio.play().catch((error) => {
+    console.error("Audio playback failed:", error);
+  });
 };
 
 const handleWebrtcAnswer = async (msg: Message) => {
@@ -1063,12 +1216,55 @@ onBeforeUnmount(() => {
             >
               {{ isCameraOn ? "关闭摄像头" : "开启摄像头" }}
             </el-button>
+
+            <el-button
+              @click="toggleScreenShare"
+              :type="isScreenSharing ? 'danger' : 'primary'"
+              :disabled="!isScreenSharing && someoneElseSharing"
+              size="small"
+              style="width: 100%"
+            >
+              {{
+                isScreenSharing
+                  ? "停止共享"
+                  : someoneElseSharing
+                    ? "他人共享中"
+                    : "共享屏幕"
+              }}
+            </el-button>
           </div>
         </div>
         <div
-          v-show="localStream && (isCameraOn || Object.keys(remoteVideoStreams).length)"
+          v-show="
+            localStream &&
+            (isCameraOn ||
+              isScreenSharing ||
+              Object.keys(remoteVideoStreams).length ||
+              Object.keys(remoteScreenStreams).length)
+          "
           class="card-body mb-2 video-wall"
         >
+          <video
+            v-if="isScreenSharing && localScreenStream"
+            v-srcobject="localScreenStream"
+            autoplay
+            playsinline
+            muted
+            title="双击全屏"
+            class="video-tile screen-tile"
+            @dblclick="toggleFullscreen"
+          ></video>
+          <video
+            v-for="(stream, id) in remoteScreenStreams"
+            :key="`screen-${id}`"
+            v-srcobject="stream"
+            autoplay
+            playsinline
+            muted
+            title="双击全屏"
+            class="video-tile screen-tile"
+            @dblclick="toggleFullscreen"
+          ></video>
           <video
             v-if="isCameraOn && localVideoStream"
             v-srcobject="localVideoStream"
@@ -1198,6 +1394,12 @@ onBeforeUnmount(() => {
   object-fit: cover;
   background-color: #000;
   border-radius: 6px;
+}
+
+.video-wall .screen-tile {
+  grid-column: 1 / -1;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
 }
 
 .audio-controls {
