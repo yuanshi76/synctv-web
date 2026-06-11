@@ -22,6 +22,7 @@ import type { options } from "@/components/Player.vue";
 import RoomInfo from "@/components/cinema/RoomInfo.vue";
 import MovieList from "@/components/cinema/MovieList.vue";
 import MoviePush from "@/components/cinema/MoviePush.vue";
+import FloatingVideo from "@/components/cinema/FloatingVideo.vue";
 import { RoomMemberPermission } from "@/types/Room";
 import artplayerPluginAss from "@/plugins/artplayer-plugin-ass";
 import { newSyncPlugin } from "@/plugins/sync";
@@ -584,17 +585,6 @@ const stopScreenShare = async () => {
   localScreenStream.value?.getTracks().forEach((track) => track.stop());
   localScreenStream.value = undefined;
   isScreenSharing.value = false;
-};
-
-// 双击视频块在全屏与还原之间切换，便于专注观看共享的屏幕。
-const toggleFullscreen = (event: MouseEvent) => {
-  const el = event.currentTarget as HTMLVideoElement | null;
-  if (!el) return;
-  if (document.fullscreenElement) {
-    document.exitFullscreen().catch((err) => console.error("退出全屏失败:", err));
-  } else {
-    el.requestFullscreen().catch((err) => console.error("进入全屏失败:", err));
-  }
 };
 
 const joinWebRTC = async () => {
@@ -1234,55 +1224,38 @@ onBeforeUnmount(() => {
             </el-button>
           </div>
         </div>
-        <div
-          v-show="
-            localStream &&
-            (isCameraOn ||
-              isScreenSharing ||
-              Object.keys(remoteVideoStreams).length ||
-              Object.keys(remoteScreenStreams).length)
-          "
-          class="card-body mb-2 video-wall"
-        >
-          <video
+        <template v-if="localStream">
+          <FloatingVideo
             v-if="isScreenSharing && localScreenStream"
-            v-srcobject="localScreenStream"
-            autoplay
-            playsinline
-            muted
-            title="双击全屏"
-            class="video-tile screen-tile"
-            @dblclick="toggleFullscreen"
-          ></video>
-          <video
-            v-for="(stream, id) in remoteScreenStreams"
+            :stream="localScreenStream"
+            label="我的屏幕"
+            variant="screen"
+            :index="0"
+          />
+          <FloatingVideo
+            v-for="(stream, id, idx) in remoteScreenStreams"
             :key="`screen-${id}`"
-            v-srcobject="stream"
-            autoplay
-            playsinline
-            muted
-            title="双击全屏"
-            class="video-tile screen-tile"
-            @dblclick="toggleFullscreen"
-          ></video>
-          <video
+            :stream="stream"
+            label="对方屏幕"
+            variant="screen"
+            :index="idx + 1"
+          />
+          <FloatingVideo
             v-if="isCameraOn && localVideoStream"
-            v-srcobject="localVideoStream"
-            autoplay
-            playsinline
-            muted
-            class="video-tile"
-          ></video>
-          <video
-            v-for="(stream, id) in remoteVideoStreams"
-            :key="id"
-            v-srcobject="stream"
-            autoplay
-            playsinline
-            muted
-            class="video-tile"
-          ></video>
-        </div>
+            :stream="localVideoStream"
+            label="我的摄像头"
+            variant="camera"
+            :index="0"
+          />
+          <FloatingVideo
+            v-for="(stream, id, idx) in remoteVideoStreams"
+            :key="`camera-${id}`"
+            :stream="stream"
+            label="对方摄像头"
+            variant="camera"
+            :index="idx + 1"
+          />
+        </template>
         <div class="card-body mb-2">
           <div class="chatArea" ref="chatArea">
             <div class="message" v-for="item in chatMsgList" :key="item">
@@ -1380,26 +1353,6 @@ onBeforeUnmount(() => {
   transition: all 0.3s ease-in-out;
   transform-origin: top;
   animation: slideDown 0.3s ease-in-out;
-}
-
-.video-wall {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-  gap: 8px;
-}
-
-.video-wall .video-tile {
-  width: 100%;
-  aspect-ratio: 4 / 3;
-  object-fit: cover;
-  background-color: #000;
-  border-radius: 6px;
-}
-
-.video-wall .screen-tile {
-  grid-column: 1 / -1;
-  aspect-ratio: 16 / 9;
-  object-fit: contain;
 }
 
 .audio-controls {
