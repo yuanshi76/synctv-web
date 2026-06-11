@@ -37,6 +37,12 @@ watch(() => props.stream, bindStream);
 const defaultWidth = props.variant === "screen" ? 360 : 220;
 const defaultHeight = props.variant === "screen" ? 203 : 165;
 
+// 当前尺寸(响应式)。用户原生缩放后由 ResizeObserver 同步回来,
+// 避免拖动触发重渲染时被写死的默认值覆盖(否则放大后一拖就被重置)。
+const width = ref(defaultWidth);
+const height = ref(defaultHeight);
+let resizeObserver: ResizeObserver | null = null;
+
 const clamp = (val: number, min: number, max: number) =>
   Math.min(Math.max(val, min), max);
 
@@ -49,8 +55,7 @@ let startY = 0;
 
 const onPointerMove = (e: PointerEvent) => {
   if (!dragging) return;
-  const w = panel.value?.offsetWidth ?? defaultWidth;
-  const h = panel.value?.offsetHeight ?? defaultHeight;
+  const w = panel.value?.offsetWidth ?? width.value;
   // 至少保留窗口在可视区域内(留出标题栏可点)
   x.value = clamp(startX + (e.clientX - startPointerX), 0, window.innerWidth - 40);
   y.value = clamp(startY + (e.clientY - startPointerY), 0, window.innerHeight - 40);
@@ -108,9 +113,21 @@ onMounted(() => {
     window.innerWidth - defaultWidth - 8
   );
   y.value = clamp(88 + offset, 8, window.innerHeight - 120);
+
+  // 监听原生缩放,把真实尺寸同步回响应式变量(折叠时高度为 auto,跳过同步以保留展开高度)
+  if (panel.value && typeof ResizeObserver !== "undefined") {
+    resizeObserver = new ResizeObserver(() => {
+      if (collapsed.value || !panel.value) return;
+      width.value = panel.value.offsetWidth;
+      height.value = panel.value.offsetHeight;
+    });
+    resizeObserver.observe(panel.value);
+  }
 });
 
 onBeforeUnmount(() => {
+  resizeObserver?.disconnect();
+  resizeObserver = null;
   window.removeEventListener("pointermove", onPointerMove);
   window.removeEventListener("pointerup", onPointerUp);
 });
@@ -124,8 +141,8 @@ onBeforeUnmount(() => {
     :style="{
       left: x + 'px',
       top: y + 'px',
-      width: defaultWidth + 'px',
-      height: collapsed ? 'auto' : defaultHeight + 'px'
+      width: width + 'px',
+      height: collapsed ? 'auto' : height + 'px'
     }"
   >
     <div class="fv-header" @pointerdown="onHeaderPointerDown">
@@ -159,6 +176,8 @@ onBeforeUnmount(() => {
   z-index: 2000;
   display: flex;
   flex-direction: column;
+  // 让 offsetWidth/offsetHeight(含边框)与内联 width/height 一致,避免缩放同步时反馈抖动
+  box-sizing: border-box;
   min-width: 140px;
   min-height: 48px;
   background-color: #000;
