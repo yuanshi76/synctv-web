@@ -282,8 +282,31 @@ const setPlayerStatus = (status: Status) => {
 
 // key: userId:connId
 const peerConnections = ref<{ [key: string]: RTCPeerConnection }>({});
+// Perfect-negotiation state per peer, keyed by userId:connId
+const peerStates: {
+  [key: string]: { polite: boolean; makingOffer: boolean; ignoreOffer: boolean };
+} = {};
 const localStream = ref<MediaStream | undefined>(undefined);
 let remoteAudioElements: { [key: string]: HTMLAudioElement } = {};
+
+const defaultICEServers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+
+// Build the ICE server list from the public settings, falling back to a
+// built-in STUN server when unset or malformed.
+const getICEServers = (): RTCIceServer[] => {
+  const raw = settings?.webrtcICEServers;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed as RTCIceServer[];
+      }
+    } catch (err) {
+      console.error("解析 webrtcICEServers 失败，使用默认 STUN:", err);
+    }
+  }
+  return defaultICEServers;
+};
 
 const peerConnectionsLengthWithUserId = computed(() => {
   const userIdSet = new Set(Object.keys(peerConnections.value).map((key) => key.split(":")[0]));
@@ -397,24 +420,17 @@ const exitWebRTC = async () => {
     const pc = peerConnections.value[id];
     pc.close();
     delete peerConnections.value[id];
+    delete peerStates[id];
   }
   localStream.value!.getTracks().forEach((track) => track.stop());
   localStream.value = undefined;
 };
 
 const handleWebrtcJoin = async (msg: Message) => {
-  const pc = createPeerConnection(msg.webrtcData!.from);
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  sendElement(
-    Message.create({
-      type: MessageType.WEBRTC_OFFER,
-      webrtcData: {
-        data: JSON.stringify(offer),
-        to: msg.webrtcData!.from
-      }
-    })
-  );
+  // Existing peers initiate the connection toward the joining peer and take the
+  // impolite role. Adding the local tracks fires onnegotiationneeded, which
+  // sends the offer automatically.
+  createPeerConnection(msg.webrtcData!.from, false);
 };
 
 const handleWebrtcLeave = async (msg: Message) => {
@@ -427,6 +443,7 @@ const closePeerConnection = (id: string) => {
     pc.close();
     delete peerConnections.value[id];
   }
+  delete peerStates[id];
   const remoteAudio = remoteAudioElements[id];
   if (remoteAudio) {
     remoteAudio.pause();
@@ -436,28 +453,64 @@ const closePeerConnection = (id: string) => {
 };
 
 const handleWebrtcOffer = async (msg: Message) => {
-  const data = JSON.parse(msg.webrtcData!.data);
-  const pc = createPeerConnection(msg.webrtcData!.from);
-  await pc.setRemoteDescription(new RTCSessionDescription(data));
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  // 将Answer发送给发送Offer的用户
+  const id = msg.webrtcData!.from;
+  const description = JSON.parse(msg.webrtcData!.data) as RTCSessionDescriptionInit;
+  let pc = peerConnections.value[id];
+  if (!pc) {
+    // First offer from this peer (we are the joining side) → polite responder.
+    pc = createPeerConnection(id, true);
+  }
+  const state = peerStates[id];
+  const offerCollision =
+    description.type === "offer" && (state.makingOffer || pc.signalingState !== "stable");
+  state.ignoreOffer = !state.polite && offerCollision;
+  if (state.ignoreOffer) {
+    return;
+  }
+  await pc.setRemoteDescription(new RTCSessionDescription(description));
+  await pc.setLocalDescription();
+  // Send the answer back to the offering peer.
   sendElement(
     Message.create({
       type: MessageType.WEBRTC_ANSWER,
       webrtcData: {
-        data: JSON.stringify(answer),
-        to: msg.webrtcData!.from
+        data: JSON.stringify(pc.localDescription),
+        to: id
       }
     })
   );
 };
 
-const createPeerConnection = (id: string) => {
+const createPeerConnection = (id: string, polite: boolean) => {
   const pc = new RTCPeerConnection({
-    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    iceServers: getICEServers(),
     iceCandidatePoolSize: 10
   });
+  peerStates[id] = { polite, makingOffer: false, ignoreOffer: false };
+
+  // Perfect negotiation: let the browser decide when (re)negotiation is needed.
+  pc.onnegotiationneeded = async () => {
+    const state = peerStates[id];
+    if (!state) return;
+    try {
+      state.makingOffer = true;
+      await pc.setLocalDescription();
+      sendElement(
+        Message.create({
+          type: MessageType.WEBRTC_OFFER,
+          webrtcData: {
+            data: JSON.stringify(pc.localDescription),
+            to: id
+          }
+        })
+      );
+    } catch (err) {
+      console.error("onnegotiationneeded 失败:", err);
+    } finally {
+      state.makingOffer = false;
+    }
+  };
+
   pc.onicecandidate = (event) => {
     if (event.candidate) {
       sendElement(
@@ -497,17 +550,26 @@ const createPeerConnection = (id: string) => {
 };
 
 const handleWebrtcAnswer = async (msg: Message) => {
-  const data = JSON.parse(msg.webrtcData!.data);
+  const description = JSON.parse(msg.webrtcData!.data) as RTCSessionDescriptionInit;
   const pc = peerConnections.value[msg.webrtcData!.from];
   if (!pc) return;
-  await pc.setRemoteDescription(new RTCSessionDescription(data));
+  await pc.setRemoteDescription(new RTCSessionDescription(description));
 };
 
 const handleWebrtcIceCandidate = async (msg: Message) => {
-  const data: RTCIceCandidateInit = JSON.parse(msg.webrtcData!.data);
-  const pc = peerConnections.value[msg.webrtcData!.from];
+  const id = msg.webrtcData!.from;
+  const candidate: RTCIceCandidateInit = JSON.parse(msg.webrtcData!.data);
+  const pc = peerConnections.value[id];
   if (!pc) return;
-  await pc.addIceCandidate(new RTCIceCandidate(data));
+  try {
+    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (err) {
+    // A discarded offer (impolite peer during glare) also discards its
+    // candidates; ignore the resulting errors instead of surfacing them.
+    if (!peerStates[id]?.ignoreOffer) {
+      throw err;
+    }
+  }
 };
 
 const handleElementMessage = (msg: Message) => {

@@ -20,4 +20,5 @@ export interface PublicSettings {
 
   guestEnable: boolean;
   p2pZone: string;
+  webrtcICEServers?: string;
 }
