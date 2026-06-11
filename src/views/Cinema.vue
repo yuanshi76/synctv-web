@@ -319,14 +319,38 @@ const audioOutputDevices = ref<MediaDeviceInfo[]>([]);
 const selectedAudioInput = ref("");
 const selectedAudioOutput = ref("");
 
+// 视频(摄像头)设备列表与状态
+const videoInputDevices = ref<MediaDeviceInfo[]>([]);
+const selectedVideoInput = ref("");
+const isCameraOn = ref(false);
+// 摄像头视频流单独保存，避免 switchMicrophone 误停视频轨道
+const localVideoStream = ref<MediaStream | undefined>(undefined);
+// 远端视频流，key: userId:connId
+const remoteVideoStreams = ref<{ [key: string]: MediaStream }>({});
+// 视频发送码率上限(bps)，限制 mesh 拓扑下的上行带宽
+const videoMaxBitrate = 600_000;
+
+// 将 MediaStream 绑定到 <video>/<audio> 元素的 srcObject
+const vSrcobject = {
+  mounted(el: HTMLMediaElement, binding: { value: MediaStream | undefined }) {
+    el.srcObject = binding.value ?? null;
+  },
+  updated(el: HTMLMediaElement, binding: { value: MediaStream | undefined }) {
+    if (el.srcObject !== binding.value) {
+      el.srcObject = binding.value ?? null;
+    }
+  }
+};
+
 const outputVolume = ref(1.0); // 扬声器音量
 const isMuted = ref(false); // 麦克风静音状态
 
-// 获取音频设备列表
+// 获取音视频设备列表
 const getAudioDevices = async () => {
   const devices = await navigator.mediaDevices.enumerateDevices();
   audioInputDevices.value = devices.filter((device) => device.kind === "audioinput");
   audioOutputDevices.value = devices.filter((device) => device.kind === "audiooutput");
+  videoInputDevices.value = devices.filter((device) => device.kind === "videoinput");
 };
 
 // 切换麦克风静音状态
@@ -393,6 +417,85 @@ const adjustOutputVolume = () => {
   });
 };
 
+// 限制视频发送码率，避免 mesh 拓扑下上行带宽随人数线性膨胀
+const applyVideoSenderParams = async (sender: RTCRtpSender) => {
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+    params.encodings[0].maxBitrate = videoMaxBitrate;
+    await sender.setParameters(params);
+  } catch (err) {
+    console.error("设置视频发送参数失败:", err);
+  }
+};
+
+// 切换摄像头开关
+const toggleCamera = async () => {
+  if (!localStream.value) return;
+  if (isCameraOn.value) {
+    await stopCamera();
+  } else {
+    await startCamera();
+  }
+};
+
+const startCamera = async () => {
+  try {
+    localVideoStream.value = await navigator.mediaDevices.getUserMedia({
+      video: selectedVideoInput.value ? { deviceId: selectedVideoInput.value } : true
+    });
+  } catch (err) {
+    ElMessage.error(`开启摄像头失败！${err}`);
+    return;
+  }
+  const [videoTrack] = localVideoStream.value.getVideoTracks();
+  if (!videoTrack) return;
+  // 向所有已建立的连接添加视频轨道，触发 onnegotiationneeded 重协商
+  for (const pc of Object.values(peerConnections.value)) {
+    const sender = pc.addTrack(videoTrack, localVideoStream.value);
+    await applyVideoSenderParams(sender);
+  }
+  isCameraOn.value = true;
+};
+
+const stopCamera = async () => {
+  for (const pc of Object.values(peerConnections.value)) {
+    for (const sender of pc.getSenders()) {
+      if (sender.track?.kind === "video") {
+        pc.removeTrack(sender);
+      }
+    }
+  }
+  localVideoStream.value?.getTracks().forEach((track) => track.stop());
+  localVideoStream.value = undefined;
+  isCameraOn.value = false;
+};
+
+// 摄像头开启状态下切换设备
+const switchCamera = async () => {
+  if (!isCameraOn.value || !localVideoStream.value) return;
+  let newStream: MediaStream;
+  try {
+    newStream = await navigator.mediaDevices.getUserMedia({
+      video: selectedVideoInput.value ? { deviceId: selectedVideoInput.value } : true
+    });
+  } catch (err) {
+    ElMessage.error(`切换摄像头失败: ${err}`);
+    return;
+  }
+  const [videoTrack] = newStream.getVideoTracks();
+  for (const pc of Object.values(peerConnections.value)) {
+    const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+    if (sender) {
+      await sender.replaceTrack(videoTrack);
+    }
+  }
+  localVideoStream.value.getTracks().forEach((track) => track.stop());
+  localVideoStream.value = newStream;
+};
+
 const joinWebRTC = async () => {
   try {
     await getAudioDevices();
@@ -424,6 +527,10 @@ const exitWebRTC = async () => {
   }
   localStream.value!.getTracks().forEach((track) => track.stop());
   localStream.value = undefined;
+  localVideoStream.value?.getTracks().forEach((track) => track.stop());
+  localVideoStream.value = undefined;
+  isCameraOn.value = false;
+  remoteVideoStreams.value = {};
 };
 
 const handleWebrtcJoin = async (msg: Message) => {
@@ -444,6 +551,7 @@ const closePeerConnection = (id: string) => {
     delete peerConnections.value[id];
   }
   delete peerStates[id];
+  delete remoteVideoStreams.value[id];
   const remoteAudio = remoteAudioElements[id];
   if (remoteAudio) {
     remoteAudio.pause();
@@ -525,6 +633,15 @@ const createPeerConnection = (id: string, polite: boolean) => {
     }
   };
   pc.ontrack = (event) => {
+    if (event.track.kind === "video") {
+      bindRemoteVideoTrack(id, event.track, event.streams[0]);
+      return;
+    }
+    // 音频已存在则复用，避免重复创建元素(重协商时 ontrack 可能再次触发)
+    if (remoteAudioElements[id]) {
+      remoteAudioElements[id].srcObject = event.streams[0];
+      return;
+    }
     const remoteAudio = document.createElement("audio");
     remoteAudio.srcObject = event.streams[0];
     remoteAudio.volume = outputVolume.value;
@@ -544,9 +661,31 @@ const createPeerConnection = (id: string, polite: boolean) => {
     });
   };
 
+  // 音频轨道
   localStream.value!.getTracks().forEach((track) => pc.addTrack(track, localStream.value!));
+  // 若本地摄像头已开启，向新连接补发视频轨道(晚加入者也能看到画面)
+  if (localVideoStream.value) {
+    for (const track of localVideoStream.value.getVideoTracks()) {
+      const sender = pc.addTrack(track, localVideoStream.value);
+      applyVideoSenderParams(sender);
+    }
+  }
   peerConnections.value[id] = pc;
   return pc;
+};
+
+// 绑定远端视频轨道到响应式 map，并处理静音/结束时的画面增删
+const bindRemoteVideoTrack = (id: string, track: MediaStreamTrack, stream: MediaStream) => {
+  remoteVideoStreams.value[id] = stream;
+  track.onunmute = () => {
+    remoteVideoStreams.value[id] = stream;
+  };
+  track.onmute = () => {
+    delete remoteVideoStreams.value[id];
+  };
+  track.onended = () => {
+    delete remoteVideoStreams.value[id];
+  };
 };
 
 const handleWebrtcAnswer = async (msg: Message) => {
@@ -901,7 +1040,52 @@ onBeforeUnmount(() => {
             >
               {{ isMuted ? "取消闭麦" : "闭麦" }}
             </el-button>
+
+            <el-select
+              v-if="videoInputDevices.length"
+              v-model="selectedVideoInput"
+              placeholder="选择摄像头"
+              @change="switchCamera"
+            >
+              <el-option
+                v-for="device in videoInputDevices"
+                :key="device.deviceId"
+                :label="device.label || `摄像头 ${device.deviceId.slice(0, 8)}`"
+                :value="device.deviceId"
+              />
+            </el-select>
+
+            <el-button
+              @click="toggleCamera"
+              :type="isCameraOn ? 'danger' : 'primary'"
+              size="small"
+              style="width: 100%"
+            >
+              {{ isCameraOn ? "关闭摄像头" : "开启摄像头" }}
+            </el-button>
           </div>
+        </div>
+        <div
+          v-show="localStream && (isCameraOn || Object.keys(remoteVideoStreams).length)"
+          class="card-body mb-2 video-wall"
+        >
+          <video
+            v-if="isCameraOn && localVideoStream"
+            v-srcobject="localVideoStream"
+            autoplay
+            playsinline
+            muted
+            class="video-tile"
+          ></video>
+          <video
+            v-for="(stream, id) in remoteVideoStreams"
+            :key="id"
+            v-srcobject="stream"
+            autoplay
+            playsinline
+            muted
+            class="video-tile"
+          ></video>
         </div>
         <div class="card-body mb-2">
           <div class="chatArea" ref="chatArea">
@@ -1000,6 +1184,20 @@ onBeforeUnmount(() => {
   transition: all 0.3s ease-in-out;
   transform-origin: top;
   animation: slideDown 0.3s ease-in-out;
+}
+
+.video-wall {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.video-wall .video-tile {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  background-color: #000;
+  border-radius: 6px;
 }
 
 .audio-controls {
